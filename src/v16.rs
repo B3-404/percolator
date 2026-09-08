@@ -608,28 +608,36 @@ fn add_open_interest_for_new_position(
 ) -> V16Result<()> {
     match side {
         SideV16::Long => {
+            let oi_eff_long_q = asset
+                .oi_eff_long_q
+                .checked_add(abs_q)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+            if oi_eff_long_q > crate::MAX_OI_SIDE_Q {
+                return Err(V16Error::InvalidLeg);
+            }
             asset.stored_pos_count_long = asset
                 .stored_pos_count_long
                 .checked_add(1)
                 .ok_or(V16Error::CounterOverflow)?;
-            asset.oi_eff_long_q = asset
-                .oi_eff_long_q
-                .checked_add(abs_q)
-                .ok_or(V16Error::ArithmeticOverflow)?;
+            asset.oi_eff_long_q = oi_eff_long_q;
             asset.loss_weight_sum_long = asset
                 .loss_weight_sum_long
                 .checked_add(loss_weight)
                 .ok_or(V16Error::ArithmeticOverflow)?;
         }
         SideV16::Short => {
+            let oi_eff_short_q = asset
+                .oi_eff_short_q
+                .checked_add(abs_q)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+            if oi_eff_short_q > crate::MAX_OI_SIDE_Q {
+                return Err(V16Error::InvalidLeg);
+            }
             asset.stored_pos_count_short = asset
                 .stored_pos_count_short
                 .checked_add(1)
                 .ok_or(V16Error::CounterOverflow)?;
-            asset.oi_eff_short_q = asset
-                .oi_eff_short_q
-                .checked_add(abs_q)
-                .ok_or(V16Error::ArithmeticOverflow)?;
+            asset.oi_eff_short_q = oi_eff_short_q;
             asset.loss_weight_sum_short = asset
                 .loss_weight_sum_short
                 .checked_add(loss_weight)
