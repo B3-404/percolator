@@ -13054,8 +13054,32 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             // provider buckets likewise leave new losses as junior support.
             self.credit_post_snapshot_residual_not_atomic(backing)?;
         } else {
-            let expiry_slot = self.fresh_counterparty_backing_expiry_slot(domain)?;
-            self.add_fresh_counterparty_backing_unchecked(domain, backing_num, expiry_slot)?;
+            let (source_backing_num, residual_backing) =
+                if decode_market_mode(self.header.mode)? == MarketModeV16::Resolved {
+                    let source = self.source_credit_for_domain(domain)?;
+                    let support_gap_num = source.positive_claim_bound_num.saturating_sub(
+                        V16Core::available_backing_num_for_source_credit_state(source)?,
+                    );
+                    let source_backing_num = backing_num.min(support_gap_num);
+                    let residual_num = backing_num
+                        .checked_sub(source_backing_num)
+                        .ok_or(V16Error::CounterUnderflow)?;
+                    (
+                        source_backing_num,
+                        V16Core::amount_from_bound_num(residual_num)?,
+                    )
+                } else {
+                    (backing_num, 0)
+                };
+            if source_backing_num != 0 {
+                let expiry_slot = self.fresh_counterparty_backing_expiry_slot(domain)?;
+                self.add_fresh_counterparty_backing_unchecked(
+                    domain,
+                    source_backing_num,
+                    expiry_slot,
+                )?;
+            }
+            self.credit_post_snapshot_residual_not_atomic(residual_backing)?;
         }
         Self::record_account_residual_crystallized_loss(account, backing)?;
         account.header.health_cert.valid = 0;
@@ -18967,8 +18991,13 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Ok(());
         }
         let ledger = self.header.resolved_payout_ledger.try_to_runtime()?;
-        // Rate is terminal only once all junior bound has been receipted/refined.
+        // The haircut rate is terminal only once all junior bound has been
+        // receipted/refined and no resolved continuation can still release
+        // post-snapshot residual into the payout pool.
         if ledger.terminal_claim_bound_unreceipted_num != 0 {
+            return Ok(());
+        }
+        if !self.resolved_positive_payout_ready()? {
             return Ok(());
         }
         if self.resolved_receipt_claimable_now(receipt)? != 0 {
@@ -19063,6 +19092,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
         }
         if converted == 0 {
+            if !self.source_domain_terminal_for_haircut_demote(source_domain, source)? {
+                return Err(V16Error::LockActive);
+            }
             // Zero-rate, sub-atom, or impaired source face remains a junior claim;
             // only its source-specific backing attribution is terminally removed.
             self.burn_account_source_claim_bound_num_domain_first(
@@ -19105,6 +19137,44 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         account.compact_source_domains();
         Ok(true)
+    }
+
+    fn source_domain_terminal_for_haircut_demote(
+        &self,
+        domain: usize,
+        retiring_source: PortfolioSourceDomainV16Account,
+    ) -> V16Result<bool> {
+        let (asset_index, loss_side) = self.domain_asset_side(domain)?;
+        let bucket = self.backing_bucket_for_domain(domain)?;
+        if matches!(
+            bucket.status,
+            BackingBucketStatusV16::Expired | BackingBucketStatusV16::Impaired
+        ) {
+            return Ok(true);
+        }
+        if retiring_source.source_claim_impaired_num.get() != 0 {
+            return Ok(true);
+        }
+        let source = self.source_credit_for_domain(domain)?;
+        let remaining_claim_num = source
+            .positive_claim_bound_num
+            .checked_sub(retiring_source.source_claim_bound_num.get())
+            .ok_or(V16Error::CounterUnderflow)?;
+        if remaining_claim_num != 0 {
+            return Ok(false);
+        }
+        let asset = self.asset_state(asset_index)?;
+        let creditor_counts = match opposite_side(loss_side) {
+            SideV16::Long => (
+                asset.stored_pos_count_long,
+                asset.pending_obligation_count_long,
+            ),
+            SideV16::Short => (
+                asset.stored_pos_count_short,
+                asset.pending_obligation_count_short,
+            ),
+        };
+        Ok(creditor_counts == (0, 0))
     }
 
     /// Commit at most one source-domain preparation mutation for resolved
@@ -19440,6 +19510,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     return Err(V16Error::InvalidLeg);
                 }
                 if self.has_pending_domain_loss_barrier(asset_index, leg.side)? {
+                    return Ok(());
+                }
+                if leg.basis_pos_q == 0
+                    && leg.loss_weight != 0
+                    && !self.recovery_pending_obligation_release_allowed(asset_index, leg.side)?
+                {
                     return Ok(());
                 }
                 let asset = self.asset_state(asset_index)?;
